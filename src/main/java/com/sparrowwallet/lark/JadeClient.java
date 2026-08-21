@@ -12,7 +12,12 @@ import com.sparrowwallet.tern.http.client.HttpClientService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.sparrowwallet.drongo.crypto.ECKey;
+import com.sparrowwallet.drongo.psbt.PSBTInput;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class JadeClient extends HardwareClient {
     private static final Logger log = LoggerFactory.getLogger(JadeClient.class);
@@ -78,6 +83,78 @@ public class JadeClient extends HardwareClient {
         }
     }
 
+    /**
+     * Anti-exfil signing over USB. Drives the two-round sign-to-contract
+     * exchange with the Jade via AntiExfilSession, calling the existing
+     * signTransaction transport once per round, and verifies every signature
+     * incorporates our host entropy before returning.
+     *
+     * Throws DeviceException (wrapping SecurityException) if verification
+     * fails on any input - the caller MUST NOT broadcast in that case.
+     */
+    PSBT signTransactionAntiExfil(PSBT psbt) throws DeviceException {
+        try(JadeDevice jadeDevice = new JadeDevice(serialPort, httpClientService)) {
+            initialize(jadeDevice);
+
+            try {
+                OutputDescriptor outputDescriptor = getOutputDescriptor(psbt);
+                if(outputDescriptor != null && outputDescriptor.isMultisig()) {
+                    String name = getWalletNameOrDefault(outputDescriptor);
+                    jadeDevice.registerMultisig(Network.getCanonical(), name, outputDescriptor);
+                }
+            } catch(DeviceException e) {
+                log.warn("Could not register wallet: " + e.getMessage());
+            } catch(RuntimeException e) {
+                log.error("Error registering wallet", e);
+            }
+
+            // Build the per-input map of THIS device's signing pubkeys, keyed by
+            // input index, from the PSBT's bip32 derivations filtered to our
+            // master fingerprint.
+            Map<Integer, List<byte[]>> signersByInput = new LinkedHashMap<>();
+            List<PSBTInput> inputs = psbt.getPsbtInputs();
+            for(int i = 0; i < inputs.size(); i++) {
+                PSBTInput input = inputs.get(i);
+                List<byte[]> signers = new ArrayList<>();
+                for(Map.Entry<ECKey, KeyDerivation> e : input.getDerivedPublicKeys().entrySet()) {
+                    String fp = e.getValue() == null ? null : e.getValue().getMasterFingerprint();
+                    if(fp != null && fp.equalsIgnoreCase(masterFingerprint)) {
+                        signers.add(e.getKey().getPubKey());
+                    }
+                }
+                if(!signers.isEmpty()) {
+                    signersByInput.put(i, signers);
+                }
+            }
+
+            if(signersByInput.isEmpty()) {
+                throw new DeviceException("No inputs for this device to anti-exfil sign");
+            }
+
+            byte[] psbtBytes = psbt.getForExport().serialize();
+            AntiExfilSession session = new AntiExfilSession(psbtBytes, signersByInput);
+
+            // Round 1: host commitments -> Jade returns signer commitments
+            byte[] round1 = session.buildRound1();
+            byte[] reply1 = jadeDevice.signTransaction(Network.getCanonical(), round1);
+            session.acceptRound1Reply(reply1);
+
+            // Round 2: reveal entropy -> Jade signs
+            byte[] round2 = session.buildRound2();
+            byte[] reply2 = jadeDevice.signTransaction(Network.getCanonical(), round2);
+
+            // Verify every signature incorporated our entropy - throws on failure
+            PSBT verified = session.verifyAndExtract(reply2);
+            return verified;
+        } catch(PSBTParseException e) {
+            throw new DeviceException("Invalid signed PSBT", e);
+        } catch(SecurityException e) {
+            throw new DeviceException("Anti-exfil verification FAILED: " + e.getMessage(), e);
+        } catch(Exception e) {
+            throw new DeviceException("Anti-exfil signing error: " + e.getMessage(), e);
+        }
+    }
+
     @Override
     String signMessage(String message, String path) throws DeviceException {
         try(JadeDevice jadeDevice = new JadeDevice(serialPort, httpClientService)) {
@@ -121,8 +198,18 @@ public class JadeClient extends HardwareClient {
         if(jadeVersion == null || jadeVersion.JADE_VERSION() == null) {
             throw new DeviceException("Not a Jade: no version info returned");
         }
-        if(jadeVersion.JADE_VERSION().compareTo(MIN_SUPPORTED_VERSION) < 0) {
-            throw new DeviceException("Jade fw version: " + jadeVersion.JADE_VERSION() + " < minimum required version: " + MIN_SUPPORTED_VERSION);
+        // JADE_VERSION arrives as a raw string. Release firmware reports semver
+        // (e.g. "1.0.34"); self-built/debug firmware may report a git hash like
+        // "b54ca0be-dirty" which is not a parseable Version. Tolerate the latter:
+        // treat an unparseable version as a dev build and skip the min-version
+        // check rather than failing to connect.
+        try {
+            Version fwVersion = new Version(jadeVersion.JADE_VERSION());
+            if(fwVersion.compareTo(MIN_SUPPORTED_VERSION) < 0) {
+                throw new DeviceException("Jade fw version: " + jadeVersion.JADE_VERSION() + " < minimum required version: " + MIN_SUPPORTED_VERSION);
+            }
+        } catch(IllegalArgumentException e) {
+            log.warn("Jade reported non-semver version '" + jadeVersion.JADE_VERSION() + "' - treating as dev build, skipping min-version check");
         }
 
         jadeDevice.addEntropy();

@@ -1,0 +1,165 @@
+package com.sparrowwallet.lark;
+
+import com.sparrowwallet.drongo.psbt.PSBT;
+import com.sparrowwallet.drongo.psbt.PSBTInput;
+import com.sparrowwallet.drongo.Utils;
+import com.sparrowwallet.drongo.crypto.ECKey;
+import com.sparrowwallet.drongo.protocol.TransactionSignature;
+
+import java.util.*;
+
+/**
+ * Orchestrates the two-round anti-exfil sign_psbt exchange with a Jade
+ * (per ae-psbt-spec.md). Transport-agnostic: caller performs delivery
+ * (JadeDevice.signTransaction over USB, or QR display/scan) between phases.
+ *
+ * Usage:
+ *   AntiExfilSession s = new AntiExfilSession(psbtBytes, signerPubkeysByInput);
+ *   byte[] round1 = s.buildRound1();          // -> deliver to Jade
+ *   s.acceptRound1Reply(jadeReply1);          // commitments in, entropy added
+ *   byte[] round2 = s.buildRound2();          // -> deliver to Jade
+ *   s.verifyAndExtract(jadeReply2);           // throws on ANY verification failure
+ */
+public class AntiExfilSession {
+
+    private static final byte PROPRIETARY = (byte)0xFC;
+    private static final byte[] ID = {'a','e'};
+    private static final byte SUB_HOST_COMMITMENT = 0x00;
+    private static final byte SUB_SIGNER_COMMITMENT = 0x01;
+    private static final byte SUB_HOST_ENTROPY = 0x02;
+
+    /** input index -> signer pubkey (33) -> host entropy (32) */
+    private final Map<Integer, Map<ByteKey, byte[]>> entropyByInput = new HashMap<>();
+    /** input index -> signer pubkey -> signer commitment R0 (33) */
+    private final Map<Integer, Map<ByteKey, byte[]>> commitmentByInput = new HashMap<>();
+    private final byte[] originalPsbt;
+    private final Map<Integer, List<byte[]>> signersByInput;
+
+    public AntiExfilSession(byte[] psbtBytes, Map<Integer, List<byte[]>> signerPubkeysByInput) {
+        this.originalPsbt = psbtBytes.clone();
+        this.signersByInput = signerPubkeysByInput;
+    }
+
+    /** Round 1 PSBT: host commitments added, no entropy. */
+    public byte[] buildRound1() throws Exception {
+        PSBT psbt = new PSBT(originalPsbt);
+        for (Map.Entry<Integer, List<byte[]>> e : signersByInput.entrySet()) {
+            PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
+            Map<ByteKey, byte[]> perKey = entropyByInput.computeIfAbsent(e.getKey(), k -> new HashMap<>());
+            for (byte[] pubkey : e.getValue()) {
+                byte[] entropy = AntiExfilVerifier.generateHostEntropy();
+                perKey.put(new ByteKey(pubkey), entropy);
+                putProprietary(input, SUB_HOST_COMMITMENT, pubkey, AntiExfilVerifier.hostCommitment(entropy));
+            }
+        }
+        return psbt.serialize();
+    }
+
+    /** Parse Jade's round-1 reply, capture signer commitments. Throws if any are missing. */
+    public void acceptRound1Reply(byte[] psbtBytes) throws Exception {
+        PSBT psbt = new PSBT(psbtBytes);
+        for (Map.Entry<Integer, Map<ByteKey, byte[]>> e : entropyByInput.entrySet()) {
+            PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
+            Map<ByteKey, byte[]> perKey = commitmentByInput.computeIfAbsent(e.getKey(), k -> new HashMap<>());
+            for (ByteKey pubkey : e.getValue().keySet()) {
+                byte[] commitment = findProprietary(input, SUB_SIGNER_COMMITMENT, pubkey.bytes);
+                if (commitment == null || commitment.length != 33) {
+                    throw new IllegalStateException("Device did not return anti-exfil commitment for input "
+                            + e.getKey() + " - device may not support anti-exfil, or is misbehaving");
+                }
+                perKey.put(pubkey, commitment);
+            }
+            if (input.getPartialSignatures() != null && !input.getPartialSignatures().isEmpty()) {
+                throw new IllegalStateException(
+                        "Device signed during commitment round - anti-exfil protocol violation");
+            }
+        }
+    }
+
+    /** Round 2 PSBT: commitments + revealed entropy. */
+    public byte[] buildRound2() throws Exception {
+        PSBT psbt = new PSBT(originalPsbt);
+        for (Map.Entry<Integer, Map<ByteKey, byte[]>> e : entropyByInput.entrySet()) {
+            PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
+            for (Map.Entry<ByteKey, byte[]> k : e.getValue().entrySet()) {
+                byte[] pubkey = k.getKey().bytes;
+                putProprietary(input, SUB_HOST_COMMITMENT, pubkey, AntiExfilVerifier.hostCommitment(k.getValue()));
+                putProprietary(input, SUB_SIGNER_COMMITMENT, pubkey, commitmentByInput.get(e.getKey()).get(k.getKey()));
+                putProprietary(input, SUB_HOST_ENTROPY, pubkey, k.getValue());
+            }
+        }
+        return psbt.serialize();
+    }
+
+    /**
+     * Verify every expected signature incorporates our entropy.
+     * @throws SecurityException on ANY failure - the caller MUST discard the
+     *         PSBT, refuse broadcast, and warn the user prominently.
+     */
+    public PSBT verifyAndExtract(byte[] signedPsbtBytes) throws Exception {
+        PSBT psbt = new PSBT(signedPsbtBytes);
+        for (Map.Entry<Integer, Map<ByteKey, byte[]>> e : entropyByInput.entrySet()) {
+            PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
+            for (Map.Entry<ByteKey, byte[]> k : e.getValue().entrySet()) {
+                byte[] sig = getPartialSignature(input, k.getKey().bytes);
+                byte[] commitment = commitmentByInput.get(e.getKey()).get(k.getKey());
+                if (sig == null) {
+                    throw new SecurityException("Missing signature for anti-exfil input " + e.getKey());
+                }
+                if (!AntiExfilVerifier.verify(sig, commitment, k.getValue())) {
+                    throw new SecurityException("ANTI-EXFIL VERIFICATION FAILED on input " + e.getKey()
+                            + ". The signing device may be leaking key material through signature nonces. "
+                            + "Do not broadcast. Treat this device as compromised.");
+                }
+                stripProprietary(input, k.getKey().bytes);
+            }
+        }
+        return psbt;
+    }
+
+    // --- proprietary field plumbing (raw key: FC | 02 'a' 'e' | subtype | pubkey33) ---
+
+    static byte[] rawKey(byte subtype, byte[] pubkey) {
+        byte[] key = new byte[1 + 1 + ID.length + 1 + 33];
+        int i = 0;
+        key[i++] = PROPRIETARY;
+        key[i++] = (byte) ID.length;
+        System.arraycopy(ID, 0, key, i, ID.length); i += ID.length;
+        key[i++] = subtype;
+        System.arraycopy(pubkey, 0, key, i, 33);
+        return key;
+    }
+
+    /* drongo stores proprietary entries in Map<String,String> (hex->hex), keyed by
+     * the PSBT key data AFTER the 0xFC keytype byte (PSBTEntry.getKeyData()).
+     * So the drongo key is rawKey(...) minus its first byte. */
+    private static String drongoKey(byte subtype, byte[] pubkey) {
+        byte[] raw = rawKey(subtype, pubkey);
+        return Utils.bytesToHex(Arrays.copyOfRange(raw, 1, raw.length));
+    }
+    private static void putProprietary(PSBTInput input, byte subtype, byte[] pubkey, byte[] value) {
+        input.getProprietary().put(drongoKey(subtype, pubkey), Utils.bytesToHex(value));
+    }
+    private static byte[] findProprietary(PSBTInput input, byte subtype, byte[] pubkey) {
+        String hex = input.getProprietary().get(drongoKey(subtype, pubkey));
+        return hex == null ? null : Utils.hexToBytes(hex);
+    }
+    private static void stripProprietary(PSBTInput input, byte[] pubkey) {
+        for (byte st : new byte[]{SUB_HOST_COMMITMENT, SUB_SIGNER_COMMITMENT, SUB_HOST_ENTROPY}) {
+            input.getProprietary().remove(drongoKey(st, pubkey));
+        }
+    }
+    private static byte[] getPartialSignature(PSBTInput input, byte[] pubkey) {
+        TransactionSignature sig = input.getPartialSignature(ECKey.fromPublicOnly(pubkey));
+        return sig == null ? null : sig.encodeToBitcoin();
+    }
+
+    /** byte[] map key wrapper */
+    static final class ByteKey {
+        final byte[] bytes;
+        ByteKey(byte[] b) { this.bytes = b.clone(); }
+        String asHex() { StringBuilder sb = new StringBuilder(); for (byte x : bytes) sb.append(String.format("%02x", x)); return sb.toString(); }
+        @Override public boolean equals(Object o) { return o instanceof ByteKey bk && Arrays.equals(bytes, bk.bytes); }
+        @Override public int hashCode() { return Arrays.hashCode(bytes); }
+    }
+}
