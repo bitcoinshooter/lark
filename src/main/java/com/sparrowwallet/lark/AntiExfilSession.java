@@ -40,24 +40,42 @@ public class AntiExfilSession {
         this.signersByInput = signerPubkeysByInput;
     }
 
-    /** Round 1 PSBT: host commitments added, no entropy. */
+    /**
+     * Round 1 PSBT: host commitments added, no entropy.
+     *
+     * Entropy is generated once per (input, pubkey) and REUSED if this is called
+     * again for the same session. See acceptRound1Reply for why: re-randomising on
+     * a retry would hand a misbehaving device a fresh attempt at the nonce.
+     */
     public byte[] buildRound1() throws Exception {
         PSBT psbt = new PSBT(originalPsbt);
         for (Map.Entry<Integer, List<byte[]>> e : signersByInput.entrySet()) {
             PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
             Map<ByteKey, byte[]> perKey = entropyByInput.computeIfAbsent(e.getKey(), k -> new HashMap<>());
             for (byte[] pubkey : e.getValue()) {
-                byte[] entropy = AntiExfilVerifier.generateHostEntropy();
-                perKey.put(new ByteKey(pubkey), entropy);
+                byte[] entropy = perKey.computeIfAbsent(new ByteKey(pubkey),
+                        k -> AntiExfilVerifier.generateHostEntropy());
                 putProprietary(input, SUB_HOST_COMMITMENT, pubkey, AntiExfilVerifier.hostCommitment(entropy));
             }
         }
         return psbt.serialize();
     }
 
-    /** Parse Jade's round-1 reply, capture signer commitments. Throws if any are missing. */
+    /**
+     * Parse Jade's round-1 reply, capture signer commitments. Throws if any are missing.
+     *
+     * If a commitment was already captured for this key in an earlier attempt, the
+     * device MUST return the same one. A device is free to fail a round at will,
+     * and each failure looks to the user like a flaky scan; if every retry drew
+     * fresh host entropy and accepted a fresh R0, the device could abort until it
+     * got a nonce it liked, grinding out a covert channel one abandoned attempt at
+     * a time. Pinning entropy per session and requiring R0 to be stable removes
+     * that. (libwally's anti-exfil documentation gives the same guidance: restart
+     * only with the same host entropy, and check the device proposes the same R0.)
+     */
     public void acceptRound1Reply(byte[] psbtBytes) throws Exception {
         PSBT psbt = new PSBT(psbtBytes);
+        requireSameTransaction(psbt, "round 1 reply");
         for (Map.Entry<Integer, Map<ByteKey, byte[]>> e : entropyByInput.entrySet()) {
             PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
             Map<ByteKey, byte[]> perKey = commitmentByInput.computeIfAbsent(e.getKey(), k -> new HashMap<>());
@@ -66,6 +84,12 @@ public class AntiExfilSession {
                 if (commitment == null || commitment.length != 33) {
                     throw new IllegalStateException("Device did not return anti-exfil commitment for input "
                             + e.getKey() + " - device may not support anti-exfil, or is misbehaving");
+                }
+                byte[] previous = perKey.get(pubkey);
+                if (previous != null && !Arrays.equals(previous, commitment)) {
+                    throw new SecurityException("Device returned a different anti-exfil commitment on retry for input "
+                            + e.getKey() + ". A device that varies its nonce commitment across attempts can grind "
+                            + "a covert channel by aborting. Do not proceed. Treat this device as compromised.");
                 }
                 perKey.put(pubkey, commitment);
             }
@@ -114,6 +138,7 @@ public class AntiExfilSession {
      */
     public PSBT verifyAndExtract(byte[] signedPsbtBytes) throws Exception {
         PSBT psbt = new PSBT(signedPsbtBytes);
+        requireSameTransaction(psbt, "signed reply");
         for (Map.Entry<Integer, Map<ByteKey, byte[]>> e : entropyByInput.entrySet()) {
             PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
             for (Map.Entry<ByteKey, byte[]> k : e.getValue().entrySet()) {
@@ -133,6 +158,22 @@ public class AntiExfilSession {
             }
         }
         return psbt;
+    }
+
+    /**
+     * Every reply must be for the transaction we sent.
+     *
+     * The sign-to-contract check proves the device folded our entropy into its
+     * nonce, but it is computed over the sighash the device itself used - it says
+     * nothing about WHICH transaction was signed. Without this, a device could
+     * return a correctly formed commitment and signature for a different
+     * transaction and pass verification. Pin the txid at every hop instead.
+     */
+    private void requireSameTransaction(PSBT reply, String stage) throws Exception {
+        if(!new PSBT(originalPsbt).matches(reply)) {
+            throw new SecurityException("Device returned a different transaction in the " + stage
+                    + " - do not broadcast. Treat this device as compromised.");
+        }
     }
 
     // --- proprietary field plumbing (raw key: FC | 02 'a' 'e' | subtype | pubkey33) ---
