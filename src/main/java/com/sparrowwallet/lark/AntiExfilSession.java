@@ -76,7 +76,23 @@ public class AntiExfilSession {
         }
     }
 
-    /** Round 2 PSBT: commitments + revealed entropy. */
+    /**
+     * Round 2 PSBT: re-sends host commitment + signer commitment + revealed
+     * entropy for every input.
+     *
+     * The host commitment is re-sent because the signing device is stateless
+     * across rounds: it re-derives tagged_hash("s2c/ecdsa/data", entropy) from
+     * the revealed entropy and rejects the input if it does not match, which is
+     * what stops the host from changing its mind about the entropy after seeing
+     * the signer commitment.
+     *
+     * The signer commitment is re-sent for spec conformance only - the device
+     * ignores it. R0 is derived deterministically from (privkey, sighash,
+     * host_commitment), so the device reproduces the same nonce in round 2
+     * without being told what it committed to. That binding is enforced
+     * host-side instead, in verifyAndExtract() below, which checks the returned
+     * signature against the R0 captured in round 1.
+     */
     public byte[] buildRound2() throws Exception {
         PSBT psbt = new PSBT(originalPsbt);
         for (Map.Entry<Integer, Map<ByteKey, byte[]>> e : entropyByInput.entrySet()) {
@@ -111,6 +127,8 @@ public class AntiExfilSession {
                             + ". The signing device may be leaking key material through signature nonces. "
                             + "Do not broadcast. Treat this device as compromised.");
                 }
+                // Verified: remove the ae proprietary fields so the returned PSBT
+                // is clean for broadcast (no anti-exfil scaffolding left behind).
                 stripProprietary(input, k.getKey().bytes);
             }
         }
@@ -158,7 +176,6 @@ public class AntiExfilSession {
     static final class ByteKey {
         final byte[] bytes;
         ByteKey(byte[] b) { this.bytes = b.clone(); }
-        String asHex() { StringBuilder sb = new StringBuilder(); for (byte x : bytes) sb.append(String.format("%02x", x)); return sb.toString(); }
         @Override public boolean equals(Object o) { return o instanceof ByteKey bk && Arrays.equals(bytes, bk.bytes); }
         @Override public int hashCode() { return Arrays.hashCode(bytes); }
     }
