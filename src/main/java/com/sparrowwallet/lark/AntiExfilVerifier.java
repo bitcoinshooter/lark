@@ -1,8 +1,11 @@
 package com.sparrowwallet.lark;
 
+import com.sparrowwallet.drongo.Utils;
+import com.sparrowwallet.drongo.crypto.ECDSASignature;
+import com.sparrowwallet.drongo.crypto.ECKey;
+import com.sparrowwallet.drongo.protocol.SignatureDecodeException;
+
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Arrays;
 
@@ -20,184 +23,171 @@ import java.util.Arrays;
  * low form, since any encoding freedom left to the device is a residual channel
  * for leaking key material a bit at a time.
  *
- * Pure Java (BigInteger EC math), no native deps. Validated against
- * ae_vectors.json generated from libwally.
+ * Drongo supplies the tagged hash, the signature decoding and canonicality
+ * rules, the curve order, and the scalar multiplication t*G. The remaining
+ * point decompression and single addition are done here with BigInteger,
+ * because drongo does not export the Bouncy Castle point types it uses
+ * internally. This is public verification touching no secret key material, so
+ * the non-constant-time arithmetic is not a side-channel concern; the secret
+ * nonce lives only on the signing device.
  */
 public final class AntiExfilVerifier {
-
-    private static final BigInteger P = new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
-    private static final BigInteger N = new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
-    /** Half the curve order. s above this is the high-S encoding of the same signature. */
-    private static final BigInteger HALF_N = N.shiftRight(1);
-    private static final BigInteger GX = new BigInteger("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16);
-    private static final BigInteger GY = new BigInteger("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16);
+    /** secp256k1 field prime. Needed for point decompression; drongo exposes the curve order but not this. */
+    private static final BigInteger FIELD_PRIME =
+            new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
     private static final BigInteger THREE = BigInteger.valueOf(3);
+    private static final BigInteger SEVEN = BigInteger.valueOf(7);
     private static final String S2C_POINT_TAG = "s2c/ecdsa/point";
     private static final String S2C_DATA_TAG = "s2c/ecdsa/data";
+    private static final int ENTROPY_LEN = 32;
+    private static final int COMMITMENT_LEN = 33;
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private AntiExfilVerifier() {}
 
     /** Generate fresh 32-byte host entropy. */
     public static byte[] generateHostEntropy() {
-        byte[] entropy = new byte[32];
+        byte[] entropy = new byte[ENTROPY_LEN];
         RANDOM.nextBytes(entropy);
         return entropy;
     }
 
     /** AE_HOST_COMMITMENT = tagged_hash("s2c/ecdsa/data", host_entropy). */
     public static byte[] hostCommitment(byte[] hostEntropy) {
-        require(hostEntropy != null && hostEntropy.length == 32, "host entropy must be 32 bytes");
-        return taggedHash(S2C_DATA_TAG, hostEntropy);
+        if(hostEntropy == null || hostEntropy.length != ENTROPY_LEN) {
+            throw new IllegalArgumentException("Host entropy must be " + ENTROPY_LEN + " bytes");
+        }
+
+        return Utils.taggedHash(S2C_DATA_TAG, hostEntropy);
     }
 
     /**
-     * Verify a DER-encoded ECDSA signature incorporated the host entropy,
-     * given the signer commitment R0 returned in round 1.
-     * Callers MUST treat false as a signing-session hard failure.
+     * Verify a DER-encoded ECDSA signature incorporated the host entropy, given
+     * the signer commitment R0 returned in round 1. Callers MUST treat false as
+     * a signing-session hard failure.
      *
-     * Note: this is PUBLIC verification - it touches no secret key material, so
-     * the non-constant-time BigInteger arithmetic below is not a side-channel
-     * concern. (The secret nonce lives only on the signing device.)
+     * Fails closed: any malformed input (bad DER, off-curve point, wrong
+     * lengths) comes from an untrusted signing device, so a parse failure is
+     * itself a verification failure. Never returns true on exception.
      */
     public static boolean verify(byte[] derSignature, byte[] signerCommitment, byte[] hostEntropy) {
         try {
-            require(signerCommitment != null && signerCommitment.length == 33, "signer commitment must be 33 bytes");
-            require(hostEntropy != null && hostEntropy.length == 32, "host entropy must be 32 bytes");
+            if(signerCommitment == null || signerCommitment.length != COMMITMENT_LEN
+                    || hostEntropy == null || hostEntropy.length != ENTROPY_LEN) {
+                return false;
+            }
 
-            // The s2c construction below only constrains R. Everything else the
+            // The s2c construction below constrains only R. Everything else the
             // device controls in the encoding is a residual covert channel, so
-            // constrain it here too: both scalars must be in range, and s must be
-            // the low encoding. Otherwise a device that commits to its nonce
-            // honestly can still leak a bit of key material per signature by
-            // choosing between the low and high S forms.
-            BigInteger[] rs = derSigRS(derSignature);
-            BigInteger r = rs[0];
-            BigInteger s = rs[1];
-            require(r.signum() > 0 && r.compareTo(N) < 0, "r outside the curve order");
-            require(s.signum() > 0 && s.compareTo(N) < 0, "s outside the curve order");
-            require(s.compareTo(HALF_N) <= 0, "high S value");
+            // constrain that here: strictly canonical DER (no padded integers,
+            // no negative scalars), and a low S value. Otherwise a device that
+            // commits to its nonce honestly can still leak a bit of key material
+            // per signature by choosing between the low and high S forms.
+            ECDSASignature signature = decodeCanonical(derSignature);
+            if(signature == null || !signature.isCanonical()
+                    || signature.r.signum() <= 0 || signature.r.compareTo(ECKey.CURVE_ORDER) >= 0
+                    || signature.s.signum() <= 0 || signature.s.compareTo(ECKey.CURVE_ORDER) >= 0) {
+                return false;
+            }
 
-            BigInteger[] r0 = liftPoint(signerCommitment);
+            byte[] message = new byte[COMMITMENT_LEN + ENTROPY_LEN];
+            System.arraycopy(signerCommitment, 0, message, 0, COMMITMENT_LEN);
+            System.arraycopy(hostEntropy, 0, message, COMMITMENT_LEN, ENTROPY_LEN);
+            BigInteger tweak = new BigInteger(1, Utils.taggedHash(S2C_POINT_TAG, message)).mod(ECKey.CURVE_ORDER);
+            if(tweak.signum() == 0) {
+                return false;
+            }
 
-            byte[] msg = new byte[65];
-            System.arraycopy(signerCommitment, 0, msg, 0, 33);
-            System.arraycopy(hostEntropy, 0, msg, 33, 32);
-            BigInteger t = new BigInteger(1, taggedHash(S2C_POINT_TAG, msg)).mod(N);
+            BigInteger[] r0 = decompress(signerCommitment);
+            BigInteger[] tweakPoint = decompress(ECKey.publicKeyFromPrivate(tweak, true));
+            BigInteger[] point = add(r0, tweakPoint);
+            if(point == null) {
+                return false;
+            }
 
-            BigInteger[] rPoint = add(r0, mul(t, new BigInteger[]{GX, GY}));
-            return rPoint != null && rPoint[0].mod(N).equals(r);
-        } catch (Exception e) {
-            // Fail closed: any malformed input (bad DER, off-curve point, wrong
-            // lengths) comes from an untrusted signing device, so a parse failure
-            // is itself a verification failure. Never return true on exception.
+            return point[0].mod(ECKey.CURVE_ORDER).equals(signature.r);
+        } catch(Exception e) {
             return false;
         }
     }
 
-    // --- internals ---
-
-    private static byte[] sha256(byte[] data) {
-        try {
-            return MessageDigest.getInstance("SHA-256").digest(data);
-        } catch (Exception e) {
-            throw new IllegalStateException(e);
-        }
-    }
-
-    /** BIP-340 style tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg). */
-    private static byte[] taggedHash(String tag, byte[] msg) {
-        byte[] tagHash = sha256(tag.getBytes(StandardCharsets.UTF_8));
-        byte[] buf = new byte[64 + msg.length];
-        System.arraycopy(tagHash, 0, buf, 0, 32);
-        System.arraycopy(tagHash, 0, buf, 32, 32);
-        System.arraycopy(msg, 0, buf, 64, msg.length);
-        return sha256(buf);
-    }
-
     /**
-     * Strictly parse a DER ECDSA signature into {r, s}, tolerating one trailing
-     * sighash byte.
+     * Strictly decode a DER signature, with or without a trailing sighash byte.
      *
-     * Strictness is a security property, not tidiness: a device free to pad an
-     * integer with a redundant leading zero, or to overstate the sequence
-     * length, has spare encoding bits it can modulate to leak key material even
-     * while committing to its nonce honestly.
+     * ECDSASignature.decodeFromDER() deliberately relaxes ASN.1 integer parsing,
+     * because pre-BIP66 signatures with padded integers exist on chain and a
+     * wallet must still verify them. That tolerance is the wrong default here:
+     * the padding freedom is itself a covert channel. So the raw bytes are put
+     * through isEncodingCanonical() first, which applies the BIP66-style rules.
+     *
+     * isEncodingCanonical() expects the trailing sighash byte present in a PSBT
+     * partial signature, so a bare DER signature has SIGHASH_ALL appended before
+     * the check. The appended byte is not otherwise used - which sighash type
+     * was signed is checked elsewhere, against the transaction.
+     *
+     * @return the decoded signature, or null if the encoding is not canonical
      */
-    private static BigInteger[] derSigRS(byte[] der) {
-        require(der != null && der.length >= 8, "not a DER signature");
-        require(der[0] == 0x30, "not a DER sequence");
+    private static ECDSASignature decodeCanonical(byte[] derSignature) throws SignatureDecodeException {
+        if(derSignature == null || derSignature.length < 8) {
+            return null;
+        }
 
-        int seqLen = der[1] & 0xFF;
-        // Exactly the signature, or the signature plus one sighash byte.
-        require(seqLen == der.length - 2 || seqLen == der.length - 3, "DER length mismatch");
-        int end = 2 + seqLen;
+        byte[] withSigHash = derSignature;
+        int sequenceLength = derSignature[1] & 0xFF;
+        if(sequenceLength == derSignature.length - 2) {
+            withSigHash = Arrays.copyOf(derSignature, derSignature.length + 1);
+            withSigHash[derSignature.length] = 0x01; // SIGHASH_ALL
+        }
 
-        require(der[2] == 0x02, "missing r integer marker");
-        int rLen = der[3] & 0xFF;
-        require(rLen > 0 && 4 + rLen + 2 <= end, "bad r length");
+        if(!ECDSASignature.isEncodingCanonical(withSigHash)) {
+            return null;
+        }
 
-        int sOff = 4 + rLen;
-        require(der[sOff] == 0x02, "missing s integer marker");
-        int sLen = der[sOff + 1] & 0xFF;
-        require(sLen > 0 && sOff + 2 + sLen == end, "bad s length");
-
-        byte[] rBytes = Arrays.copyOfRange(der, 4, 4 + rLen);
-        byte[] sBytes = Arrays.copyOfRange(der, sOff + 2, sOff + 2 + sLen);
-        requireMinimalInteger(rBytes, "r");
-        requireMinimalInteger(sBytes, "s");
-        return new BigInteger[]{new BigInteger(1, rBytes), new BigInteger(1, sBytes)};
+        return ECDSASignature.decodeFromDER(derSignature);
     }
 
-    /** DER integers are signed and minimally encoded: no negatives, no redundant leading zero. */
-    private static void requireMinimalInteger(byte[] value, String name) {
-        require((value[0] & 0x80) == 0, name + " is negative");
-        require(value.length == 1 || value[0] != 0x00 || (value[1] & 0x80) != 0,
-                name + " has a redundant leading zero");
-    }
-
-    /** Decompress a 33-byte SEC1 point. */
-    private static BigInteger[] liftPoint(byte[] compressed) {
+    /** Decompress a 33-byte SEC1 point to affine {x, y}. */
+    private static BigInteger[] decompress(byte[] compressed) {
         int prefix = compressed[0] & 0xFF;
-        require(prefix == 2 || prefix == 3, "invalid point prefix");
-        BigInteger x = new BigInteger(1, Arrays.copyOfRange(compressed, 1, 33));
-        require(x.compareTo(P) < 0, "x out of range");
-        BigInteger y2 = x.modPow(THREE, P).add(BigInteger.valueOf(7)).mod(P);
-        BigInteger y = y2.modPow(P.add(BigInteger.ONE).shiftRight(2), P);
-        require(y.modPow(BigInteger.TWO, P).equals(y2), "x not on curve");
-        if (y.testBit(0) != (prefix == 3)) {
-            y = P.subtract(y);
+        if(prefix != 2 && prefix != 3) {
+            throw new IllegalArgumentException("Invalid point prefix");
         }
-        return new BigInteger[]{x, y};
+
+        BigInteger x = new BigInteger(1, Arrays.copyOfRange(compressed, 1, COMMITMENT_LEN));
+        if(x.compareTo(FIELD_PRIME) >= 0) {
+            throw new IllegalArgumentException("Point x coordinate out of range");
+        }
+
+        BigInteger ySquared = x.modPow(THREE, FIELD_PRIME).add(SEVEN).mod(FIELD_PRIME);
+        BigInteger y = ySquared.modPow(FIELD_PRIME.add(BigInteger.ONE).shiftRight(2), FIELD_PRIME);
+        if(!y.modPow(BigInteger.TWO, FIELD_PRIME).equals(ySquared)) {
+            throw new IllegalArgumentException("Point not on curve");
+        }
+
+        if(y.testBit(0) != (prefix == 3)) {
+            y = FIELD_PRIME.subtract(y);
+        }
+
+        return new BigInteger[] {x, y};
     }
 
+    /** Affine point addition. Returns null for the point at infinity. */
     private static BigInteger[] add(BigInteger[] a, BigInteger[] b) {
-        if (a == null) return b;
-        if (b == null) return a;
-        if (a[0].equals(b[0]) && a[1].add(b[1]).mod(P).signum() == 0) return null;
+        if(a[0].equals(b[0]) && a[1].add(b[1]).mod(FIELD_PRIME).signum() == 0) {
+            return null;
+        }
+
         BigInteger lambda;
-        if (a[0].equals(b[0]) && a[1].equals(b[1])) {
-            lambda = THREE.multiply(a[0]).multiply(a[0]).multiply(a[1].shiftLeft(1).modInverse(P)).mod(P);
+        if(a[0].equals(b[0]) && a[1].equals(b[1])) {
+            lambda = THREE.multiply(a[0]).multiply(a[0])
+                    .multiply(a[1].shiftLeft(1).modInverse(FIELD_PRIME)).mod(FIELD_PRIME);
         } else {
-            lambda = b[1].subtract(a[1]).multiply(b[0].subtract(a[0]).modInverse(P)).mod(P);
+            lambda = b[1].subtract(a[1])
+                    .multiply(b[0].subtract(a[0]).modInverse(FIELD_PRIME)).mod(FIELD_PRIME);
         }
-        BigInteger x3 = lambda.multiply(lambda).subtract(a[0]).subtract(b[0]).mod(P);
-        BigInteger y3 = lambda.multiply(a[0].subtract(x3)).subtract(a[1]).mod(P);
-        return new BigInteger[]{x3, y3};
-    }
 
-    private static BigInteger[] mul(BigInteger k, BigInteger[] point) {
-        BigInteger[] result = null;
-        BigInteger[] addend = point;
-        while (k.signum() > 0) {
-            if (k.testBit(0)) result = add(result, addend);
-            addend = add(addend, addend);
-            k = k.shiftRight(1);
-        }
-        return result;
-    }
-
-    private static void require(boolean cond, String msg) {
-        if (!cond) throw new IllegalArgumentException(msg);
+        BigInteger x = lambda.multiply(lambda).subtract(a[0]).subtract(b[0]).mod(FIELD_PRIME);
+        BigInteger y = lambda.multiply(a[0].subtract(x)).subtract(a[1]).mod(FIELD_PRIME);
+        return new BigInteger[] {x, y};
     }
 }
