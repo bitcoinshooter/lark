@@ -35,9 +35,32 @@ public class AntiExfilSession {
     private final byte[] originalPsbt;
     private final Map<Integer, List<byte[]>> signersByInput;
 
+    /**
+     * Where host entropy comes from. Defaults to the system CSPRNG.
+     *
+     * Injectable for two reasons. It lets a test replay a recorded hardware
+     * ceremony with the entropy that run actually used, so the honest path can
+     * be asserted end to end rather than only structurally. And it is the seam
+     * a deterministic derivation would sit behind, if host entropy is ever
+     * rederived from a coordinator secret so that a session survives restart
+     * without persisting anything unrevealed.
+     */
+    @FunctionalInterface
+    public interface HostEntropySource {
+        byte[] entropyFor(int inputIndex, byte[] signerPubkey);
+    }
+
+    private final HostEntropySource entropySource;
+
     public AntiExfilSession(byte[] psbtBytes, Map<Integer, List<byte[]>> signerPubkeysByInput) {
+        this(psbtBytes, signerPubkeysByInput, (i, k) -> AntiExfilVerifier.generateHostEntropy());
+    }
+
+    public AntiExfilSession(byte[] psbtBytes, Map<Integer, List<byte[]>> signerPubkeysByInput,
+                            HostEntropySource entropySource) {
         this.originalPsbt = psbtBytes.clone();
         this.signersByInput = signerPubkeysByInput;
+        this.entropySource = entropySource;
     }
 
     /**
@@ -54,7 +77,7 @@ public class AntiExfilSession {
             Map<ByteKey, byte[]> perKey = entropyByInput.computeIfAbsent(e.getKey(), k -> new HashMap<>());
             for (byte[] pubkey : e.getValue()) {
                 byte[] entropy = perKey.computeIfAbsent(new ByteKey(pubkey),
-                        k -> AntiExfilVerifier.generateHostEntropy());
+                        k -> entropySource.entropyFor(e.getKey(), pubkey));
                 putProprietary(input, SUB_HOST_COMMITMENT, pubkey, AntiExfilVerifier.hostCommitment(entropy));
             }
         }
@@ -147,6 +170,7 @@ public class AntiExfilSession {
                 if (sig == null) {
                     throw new SecurityException("Missing signature for anti-exfil input " + e.getKey());
                 }
+                requireValidSignature(input, k.getKey().bytes, e.getKey());
                 if (!AntiExfilVerifier.verify(sig, commitment, k.getValue())) {
                     throw new SecurityException("ANTI-EXFIL VERIFICATION FAILED on input " + e.getKey()
                             + ". The signing device may be leaking key material through signature nonces. "
@@ -158,6 +182,42 @@ public class AntiExfilSession {
             }
         }
         return psbt;
+    }
+
+    /**
+     * The signature must be a valid ECDSA signature for this pubkey over this
+     * input's sighash, not merely one whose r matches the committed point.
+     *
+     * The sign-to-contract check constrains R and nothing else. A device could
+     * return a well-formed R with a junk s, pass anti-exfil verification, and
+     * fail later at finalisation with an unrelated error - which is a worse
+     * outcome than it sounds, because the user is then told the transaction is
+     * broken rather than that the device misbehaved. Checking validity here
+     * means every failure in this method carries the same meaning: the device
+     * did not do what it was asked.
+     *
+     * Deliberately at the protocol layer rather than inside AntiExfilVerifier.
+     * The verifier is the crypto layer - it takes a signature, an opening and
+     * entropy, and answers one question about the s2c construction. That is the
+     * layer at which the shared vectors live, and those vectors carry no pubkey
+     * or sighash, so folding ECDSA validation into it would make them
+     * unrunnable. Here, the PSBT input is in hand and drongo already knows how
+     * to derive the sighash for it, including script type and sighash flag
+     * handling that this class has no business reimplementing.
+     *
+     * getSigningKeys() returns only keys whose signature verifies, so an empty
+     * result is a verification failure. It returns empty if the signing script
+     * cannot be derived - a reply stripped of its utxo data, say - which is
+     * also a reply that should not be trusted, so failing closed on that is
+     * correct rather than merely convenient.
+     */
+    private void requireValidSignature(PSBTInput input, byte[] pubkey, int index) {
+        ECKey key = ECKey.fromPublicOnly(pubkey);
+        if (!input.getSigningKeys(Set.of(key)).containsKey(key)) {
+            throw new SecurityException("Signature on input " + index + " is not a valid signature for the "
+                    + "expected key. The signing device returned something it did not sign correctly. "
+                    + "Do not broadcast. Treat this device as compromised.");
+        }
     }
 
     /**

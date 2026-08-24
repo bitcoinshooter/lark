@@ -45,6 +45,30 @@ public final class AntiExfilVerifier {
 
     private AntiExfilVerifier() {}
 
+    /**
+     * Whether a 32-byte s2c tweak is acceptable as a scalar.
+     *
+     * libsecp256k1-zkp REJECTS a tweak at or above the curve order rather than
+     * reducing it: secp256k1_ec_pubkey_tweak_add_helper returns !overflow &amp;&amp; ...,
+     * so secp256k1_ec_commit fails and ecdsa_s2c_verify returns 0. Reducing here
+     * would make this verifier more permissive than the signer it is checking,
+     * which is the wrong direction for a security check.
+     *
+     * Exposed separately because the rule cannot be reached through a real
+     * tagged hash - producing an out-of-range one is roughly 2^128 work - so an
+     * end-to-end vector can never exercise it. Driving the scalar directly is
+     * the only way to test the boundary, and it lets other implementations
+     * conform against the same three cases: in range, zero, at or above n.
+     */
+    public static boolean isAcceptableTweak(byte[] tweak32) {
+        if(tweak32 == null || tweak32.length != ENTROPY_LEN) {
+            return false;
+        }
+
+        BigInteger tweak = new BigInteger(1, tweak32);
+        return tweak.signum() != 0 && tweak.compareTo(ECKey.CURVE_ORDER) < 0;
+    }
+
     /** Generate fresh 32-byte host entropy. */
     public static byte[] generateHostEntropy() {
         byte[] entropy = new byte[ENTROPY_LEN];
@@ -93,17 +117,15 @@ public final class AntiExfilVerifier {
             byte[] message = new byte[COMMITMENT_LEN + ENTROPY_LEN];
             System.arraycopy(signerCommitment, 0, message, 0, COMMITMENT_LEN);
             System.arraycopy(hostEntropy, 0, message, COMMITMENT_LEN, ENTROPY_LEN);
-            // libsecp256k1-zkp REJECTS a tweak at or above the curve order rather
-            // than reducing it: secp256k1_ec_pubkey_tweak_add_helper returns
-            // !overflow && ..., so secp256k1_ec_commit fails and ecdsa_s2c_verify
-            // returns 0. Reducing here would make this verifier more permissive
-            // than the signer it is checking, which is the wrong direction for a
-            // security check. The gap between 2^256 and n is ~2^128, so this is
-            // unreachable in practice; it is a conformance matter, not a live case.
-            BigInteger tweak = new BigInteger(1, Utils.taggedHash(S2C_POINT_TAG, message));
-            if(tweak.signum() == 0 || tweak.compareTo(ECKey.CURVE_ORDER) >= 0) {
+            // Scalar acceptance rule is in isAcceptableTweak() so that the
+            // boundary can be tested directly; a real tagged hash never reaches
+            // it. The gap between 2^256 and n is ~2^128, so this is a
+            // conformance matter, not a live case.
+            byte[] tweakBytes = Utils.taggedHash(S2C_POINT_TAG, message);
+            if(!isAcceptableTweak(tweakBytes)) {
                 return false;
             }
+            BigInteger tweak = new BigInteger(1, tweakBytes);
 
             BigInteger[] r0 = decompress(signerCommitment);
             BigInteger[] tweakPoint = decompress(ECKey.publicKeyFromPrivate(tweak, true));

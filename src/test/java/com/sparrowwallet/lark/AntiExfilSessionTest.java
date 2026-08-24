@@ -78,6 +78,80 @@ public class AntiExfilSessionTest {
                 Map.of(0, List.of(hex(SIGNER_PUBKEY))));
     }
 
+    /**
+     * The host entropy the recorded testnet4 run actually used, recovered from
+     * the ae host_entropy field of the round 2 reply. With this injected, the
+     * four recorded PSBTs replay as the ceremony that happened on hardware.
+     */
+    private static final String RECORDED_HOST_ENTROPY =
+            "40d01a3c67c6f762519959eaf013f871b5d024caf70b68cc6552d0a13939493a";
+
+    /**
+     * The honest path, end to end, against real hardware output.
+     *
+     * Every other test here asserts that something bad is rejected. Negative
+     * coverage alone cannot distinguish a verifier that is correct from one
+     * that rejects everything, so this asserts the ceremony that actually
+     * happened on a Jade completes: commitments captured, entropy revealed in
+     * round 2, signature verified against the committed nonce point, and the ae
+     * scaffolding stripped from the returned PSBT.
+     */
+    @Test
+    public void testHonestSessionReplayCompletes() throws Exception {
+        byte[] entropy = hex(RECORDED_HOST_ENTROPY);
+        AntiExfilSession session = new AntiExfilSession(b64(ROUND1_OUT),
+                Map.of(0, List.of(hex(SIGNER_PUBKEY))),
+                (index, pubkey) -> entropy);
+
+        byte[] round1 = session.buildRound1();
+        assertNotNull(round1, "round 1 must build");
+
+        session.acceptRound1Reply(b64(ROUND1_REPLY));
+
+        byte[] round2 = session.buildRound2();
+        PSBT round2Psbt = new PSBT(round2);
+        PSBTInput round2Input = round2Psbt.getPsbtInputs().get(0);
+        assertEquals(3, countAeFields(round2Input),
+                "round 2 carries host commitment, signer commitment and revealed entropy");
+
+        PSBT verified = session.verifyAndExtract(b64(ROUND2_REPLY));
+        PSBTInput verifiedInput = verified.getPsbtInputs().get(0);
+        assertFalse(verifiedInput.getPartialSignatures().isEmpty(),
+                "the verified PSBT keeps its signature");
+        assertEquals(0, countAeFields(verifiedInput),
+                "ae scaffolding is stripped once verification succeeds");
+    }
+
+    /**
+     * Same ceremony, wrong entropy. Guards against the replay above passing for
+     * a reason other than the s2c relation holding - if this also passed, the
+     * verification step would not be doing anything.
+     */
+    @Test
+    public void testHonestReplayWithDifferentEntropyRejected() {
+        byte[] wrong = hex(RECORDED_HOST_ENTROPY.substring(0, 62) + "00");
+        assertThrows(SecurityException.class, () -> {
+            AntiExfilSession session = new AntiExfilSession(b64(ROUND1_OUT),
+                    Map.of(0, List.of(hex(SIGNER_PUBKEY))),
+                    (index, pubkey) -> wrong);
+            session.buildRound1();
+            session.acceptRound1Reply(b64(ROUND1_REPLY));
+            session.buildRound2();
+            session.verifyAndExtract(b64(ROUND2_REPLY));
+        }, "a signature bound to different entropy must not verify");
+    }
+
+    private static int countAeFields(PSBTInput input) {
+        int count = 0;
+        for(String key : input.getProprietary().keySet()) {
+            // drongo stores the key data after the 0xFC byte: 02 'a' 'e' subtype pubkey
+            if(key.startsWith("026165")) {
+                count++;
+            }
+        }
+        return count;
+    }
+
     // --- transaction pinning ---
 
     @Test

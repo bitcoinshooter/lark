@@ -24,8 +24,14 @@ public class AntiExfilVerifierTest {
     private static final BigInteger CURVE_ORDER =
             new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
 
-    /** der_sig, signer_commitment, host_entropy, expected */
-    private static final String[][] VECTORS = {
+    /**
+     * der_sig, signer_commitment, host_entropy, expected
+     *
+     * Package-visible so AntiExfilVectorExport emits these exact rows rather
+     * than a copy. A corpus that has drifted from the tests it was taken from
+     * is worse than no corpus.
+     */
+    static final String[][] VECTORS = {
             {"3045022100dde41a13c1f0c110c098530bf8e6569da5ac534e821c1991309d3781dca7ba69022057f63eddfeb199f98d68a43a1f5651cc2ed5229ddcb9002382658f3d75ae0e64",
              "02ed60b58309d8ef89490792d1e57186620d55b4bc2bf976fb23c68bd5fc37cb82",
              "fdb68f55f9ce5210c37f3c7025681c1500c0a22b285ad15d0fffab687d354992", "true"},
@@ -98,6 +104,35 @@ public class AntiExfilVerifierTest {
         String[] v = VECTORS[0];
         assertTrue(AntiExfilVerifier.verify(hex(v[0]), hex(v[1]), hex(v[2])),
                 "an in-range tweak must still verify");
+    }
+
+    @Test
+    public void testTweakBoundaryRule() {
+        // The primitive-boundary case: the scalar acceptance rule, driven
+        // directly, because a real tagged hash cannot reach it (~2^128 work).
+        // These are the three cases a conforming implementation must agree on.
+        byte[] inRange = new byte[32];
+        inRange[31] = 0x01;
+        byte[] zero = new byte[32];
+        byte[] atOrder = hexOf(CURVE_ORDER);
+        byte[] max = new byte[32];
+        Arrays.fill(max, (byte)0xFF);
+
+        assertTrue(AntiExfilVerifier.isAcceptableTweak(inRange), "1 is in range");
+        assertFalse(AntiExfilVerifier.isAcceptableTweak(zero), "zero tweak must be rejected");
+        assertFalse(AntiExfilVerifier.isAcceptableTweak(atOrder), "tweak == n must be rejected, not reduced");
+        assertFalse(AntiExfilVerifier.isAcceptableTweak(max), "2^256-1 must be rejected, not reduced");
+        assertFalse(AntiExfilVerifier.isAcceptableTweak(null), "null");
+        assertFalse(AntiExfilVerifier.isAcceptableTweak(new byte[31]), "wrong length");
+    }
+
+    /** 32-byte big-endian encoding, left-padded. */
+    private static byte[] hexOf(BigInteger v) {
+        byte[] raw = v.toByteArray();
+        byte[] out = new byte[32];
+        int len = Math.min(raw.length, 32);
+        System.arraycopy(raw, raw.length - len, out, 32 - len, len);
+        return out;
     }
 
     @Test
