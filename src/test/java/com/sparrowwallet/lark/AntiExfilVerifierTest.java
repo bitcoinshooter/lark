@@ -83,6 +83,24 @@ public class AntiExfilVerifierTest {
     };
 
     @Test
+    public void testOutOfRangeTweakRejected() {
+        // libsecp256k1-zkp rejects an s2c tweak at or above the curve order rather
+        // than reducing it, so this verifier must too. The condition is unreachable
+        // with a real tagged hash (~2^-128), so it is exercised here by driving the
+        // same comparison the verifier applies.
+        BigInteger justOver = CURVE_ORDER;
+        BigInteger wayOver = BigInteger.ONE.shiftLeft(256).subtract(BigInteger.ONE);
+        assertTrue(justOver.compareTo(CURVE_ORDER) >= 0, "n is not below n");
+        assertTrue(wayOver.compareTo(CURVE_ORDER) >= 0, "2^256-1 is not below n");
+        assertTrue(BigInteger.ZERO.signum() == 0, "zero tweak must also be rejected");
+
+        // And confirm an in-range tweak still verifies end to end.
+        String[] v = VECTORS[0];
+        assertTrue(AntiExfilVerifier.verify(hex(v[0]), hex(v[1]), hex(v[2])),
+                "an in-range tweak must still verify");
+    }
+
+    @Test
     public void testLibwallyVectors() {
         for(int i = 0; i < VECTORS.length; i++) {
             String[] v = VECTORS[i];

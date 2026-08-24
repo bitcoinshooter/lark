@@ -93,8 +93,15 @@ public final class AntiExfilVerifier {
             byte[] message = new byte[COMMITMENT_LEN + ENTROPY_LEN];
             System.arraycopy(signerCommitment, 0, message, 0, COMMITMENT_LEN);
             System.arraycopy(hostEntropy, 0, message, COMMITMENT_LEN, ENTROPY_LEN);
-            BigInteger tweak = new BigInteger(1, Utils.taggedHash(S2C_POINT_TAG, message)).mod(ECKey.CURVE_ORDER);
-            if(tweak.signum() == 0) {
+            // libsecp256k1-zkp REJECTS a tweak at or above the curve order rather
+            // than reducing it: secp256k1_ec_pubkey_tweak_add_helper returns
+            // !overflow && ..., so secp256k1_ec_commit fails and ecdsa_s2c_verify
+            // returns 0. Reducing here would make this verifier more permissive
+            // than the signer it is checking, which is the wrong direction for a
+            // security check. The gap between 2^256 and n is ~2^128, so this is
+            // unreachable in practice; it is a conformance matter, not a live case.
+            BigInteger tweak = new BigInteger(1, Utils.taggedHash(S2C_POINT_TAG, message));
+            if(tweak.signum() == 0 || tweak.compareTo(ECKey.CURVE_ORDER) >= 0) {
                 return false;
             }
 
