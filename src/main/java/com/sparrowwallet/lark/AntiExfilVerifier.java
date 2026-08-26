@@ -39,7 +39,8 @@ public final class AntiExfilVerifier {
     private static final BigInteger SEVEN = BigInteger.valueOf(7);
     private static final String S2C_POINT_TAG = "s2c/ecdsa/point";
     private static final String S2C_DATA_TAG = "s2c/ecdsa/data";
-    private static final int ENTROPY_LEN = 32;
+    /** Host entropy is 32 bytes. Package-visible: the session validates against it. */
+    static final int ENTROPY_LEN = 32;
     private static final int COMMITMENT_LEN = 33;
     private static final SecureRandom RANDOM = new SecureRandom();
 

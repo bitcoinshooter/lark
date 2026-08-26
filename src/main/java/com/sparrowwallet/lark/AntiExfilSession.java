@@ -72,16 +72,55 @@ public class AntiExfilSession {
      */
     public byte[] buildRound1() throws Exception {
         PSBT psbt = new PSBT(originalPsbt);
+        Set<ByteKey> entropySeen = new HashSet<>();
+        Set<ByteKey> commitmentsSeen = new HashSet<>();
         for (Map.Entry<Integer, List<byte[]>> e : signersByInput.entrySet()) {
             PSBTInput input = psbt.getPsbtInputs().get(e.getKey());
             Map<ByteKey, byte[]> perKey = entropyByInput.computeIfAbsent(e.getKey(), k -> new HashMap<>());
             for (byte[] pubkey : e.getValue()) {
                 byte[] entropy = perKey.computeIfAbsent(new ByteKey(pubkey),
                         k -> entropySource.entropyFor(e.getKey(), pubkey));
-                putProprietary(input, SUB_HOST_COMMITMENT, pubkey, AntiExfilVerifier.hostCommitment(entropy));
+                requireUsableEntropy(entropy, e.getKey());
+                byte[] commitment = AntiExfilVerifier.hostCommitment(entropy);
+                requireDistinct(entropySeen, entropy, "host entropy", e.getKey());
+                requireDistinct(commitmentsSeen, commitment, "host commitment", e.getKey());
+                putProprietary(input, SUB_HOST_COMMITMENT, pubkey, commitment);
             }
         }
         return psbt.serialize();
+    }
+
+    /**
+     * The entropy source is an extension point, so its output is validated
+     * rather than trusted. A source returning null, a short buffer or a
+     * constant would otherwise degrade the protection silently: the exchange
+     * would still complete and still report success.
+     */
+    private void requireUsableEntropy(byte[] entropy, int index) {
+        if (entropy == null || entropy.length != AntiExfilVerifier.ENTROPY_LEN) {
+            throw new IllegalStateException("Host entropy for input " + index + " must be exactly "
+                    + AntiExfilVerifier.ENTROPY_LEN + " bytes, got "
+                    + (entropy == null ? "null" : entropy.length + " bytes"));
+        }
+    }
+
+    /**
+     * Entropy must be independent per slot, so a repeat across the slot set is
+     * a fault in the source rather than bad luck - a 32-byte collision from a
+     * sound generator will not happen. Checked before round 1 is emitted, since
+     * afterwards the commitments are already in the device's hands.
+     *
+     * Commitments are checked as well as entropy. They are derived, so a
+     * collision implies one in the entropy, but checking both means a source
+     * that somehow produces distinct entropy mapping to one commitment is
+     * caught rather than assumed impossible.
+     */
+    private void requireDistinct(Set<ByteKey> seen, byte[] value, String what, int index) {
+        if (!seen.add(new ByteKey(value))) {
+            throw new IllegalStateException("Duplicate " + what + " across the slot set at input " + index
+                    + ". Every slot must get independent entropy; a repeat means the entropy source is faulty. "
+                    + "Refusing to send round 1.");
+        }
     }
 
     /**
@@ -170,7 +209,7 @@ public class AntiExfilSession {
                 if (sig == null) {
                     throw new SecurityException("Missing signature for anti-exfil input " + e.getKey());
                 }
-                requireValidSignature(input, k.getKey().bytes, e.getKey());
+                requireValidSignature(input, k.getKey().bytes, sig, e.getKey());
                 if (!AntiExfilVerifier.verify(sig, commitment, k.getValue())) {
                     throw new SecurityException("ANTI-EXFIL VERIFICATION FAILED on input " + e.getKey()
                             + ". The signing device may be leaking key material through signature nonces. "
@@ -205,17 +244,45 @@ public class AntiExfilSession {
      * to derive the sighash for it, including script type and sighash flag
      * handling that this class has no business reimplementing.
      *
-     * getSigningKeys() returns only keys whose signature verifies, so an empty
-     * result is a verification failure. It returns empty if the signing script
-     * cannot be derived - a reply stripped of its utxo data, say - which is
-     * also a reply that should not be trusted, so failing closed on that is
-     * correct rather than merely convenient.
+     * getSigningKeys() returns empty if the signing script cannot be derived -
+     * a reply stripped of its utxo data, say - which is also a reply that
+     * should not be trusted, so failing closed on that is correct rather than
+     * merely convenient.
+     *
+     * BOTH RELATIONS MUST BIND THE SAME SIGNATURE. getSigningKeys() searches
+     * every signature present on the input and returns the key if ANY of them
+     * verifies under it:
+     *
+     *     for(TransactionSignature signature : signatures)
+     *         if(sigPublicKey.verify(hash, signature))
+     *             signingKeys.put(sigPublicKey, signature);
+     *
+     * so on a multisig input, a co-signer's valid signature could satisfy the
+     * ECDSA half while the s2c half is checked against the signature stored
+     * under our key. Testing containsKey() alone therefore proves that SOME
+     * signature on this input is valid, not that OURS is - which is not the
+     * property we need. Comparing the returned signature against the exact
+     * bytes closes that: acceptance now requires the very signature the s2c
+     * check will run on to be the one that verified.
+     *
+     * Note the map is overwritten on each match, so if two signatures verify
+     * under the same key the later one wins and the comparison fails even
+     * though ours was valid. That is a false negative, which fails closed, and
+     * is the correct direction for the edge case.
+     *
+     * Interim. The destination is a verifier taking (pubkey, host-authoritative
+     * sighash, entropy, opening, signature) and requiring both relations over
+     * one parsed signature. That needs a drongo entry point for verifying a
+     * specific mapped partial signature, since getHashForSignature() and
+     * getDefaultSigHash() are private and no public sighash accessor exists.
      */
-    private void requireValidSignature(PSBTInput input, byte[] pubkey, int index) {
+    private void requireValidSignature(PSBTInput input, byte[] pubkey, byte[] expectedSignature, int index) {
         ECKey key = ECKey.fromPublicOnly(pubkey);
-        if (!input.getSigningKeys(Set.of(key)).containsKey(key)) {
+        TransactionSignature verified = input.getSigningKeys(Set.of(key)).get(key);
+        if (verified == null || !Arrays.equals(verified.encodeToBitcoin(), expectedSignature)) {
             throw new SecurityException("Signature on input " + index + " is not a valid signature for the "
-                    + "expected key. The signing device returned something it did not sign correctly. "
+                    + "expected key, or the signature that verified is not the one stored for that key. "
+                    + "The signing device returned something it did not sign correctly. "
                     + "Do not broadcast. Treat this device as compromised.");
         }
     }

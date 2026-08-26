@@ -15,6 +15,11 @@ Checks, in order:
   2. Derivation  - host_commitment really is tagged_hash("s2c/ecdsa/data", rho).
   3. Encoding    - strict DER, canonical integers, low-S, scalars in range.
   4. Relation    - sig.r == (R0 + t*G).x mod n, and the stated verdict matches.
+                   Where a case also carries pubkey and message_hash, ordinary
+                   ECDSA is verified too and expected_combined must equal
+                   expected_s2c AND expected_ecdsa. Cases without them are
+                   checked for the s2c relation alone, so both corpora run
+                   against this checker unchanged.
   5. Boundary    - the tweak acceptance rule over its four cases.
   6. Coverage    - the corpus contains both accepting and rejecting cases, and
                    each declared class behaves as its name claims.
@@ -118,6 +123,20 @@ def parse_der_strict(der):
     return int.from_bytes(rb, "big"), int.from_bytes(sb, "big")
 
 
+def ecdsa_verify(pubkey33, msg32, r, s):
+    """Textbook ECDSA verification. Independent of any library."""
+    if not (0 < r < N and 0 < s < N):
+        return False
+    Q = decompress(pubkey33)
+    z = int.from_bytes(msg32, "big")
+    w = pow(s, N - 2, N)
+    u1, u2 = (z * w) % N, (r * w) % N
+    X = point_add(point_mul(u1), point_mul(u2, Q))
+    if X is None:
+        return False
+    return X[0] % N == r
+
+
 def acceptable_tweak(t32):
     if len(t32) != 32:
         return False
@@ -166,8 +185,20 @@ def main(path):
         check(len(v["host_entropy"]) == 64, f"{v['id']}: entropy is not 32 bytes")
         check(len(v["host_commitment"]) == 64, f"{v['id']}: commitment is not 32 bytes")
         check(isinstance(v["expected_s2c"], bool), f"{v['id']}: expected_s2c not boolean")
-        check(v.get("expected_ecdsa") is None and v.get("expected_combined") is None,
-              f"{v['id']}: ecdsa verdicts should be null without pubkey/message_hash")
+        complete = v.get("pubkey") is not None and v.get("message_hash") is not None
+        if complete:
+            check(len(v["pubkey"]) == 66, f"{v['id']}: pubkey is not 33 bytes")
+            check(len(v["message_hash"]) == 64, f"{v['id']}: message_hash is not 32 bytes")
+            check(isinstance(v.get("expected_ecdsa"), bool),
+                  f"{v['id']}: complete tuple must state expected_ecdsa")
+            check(isinstance(v.get("expected_combined"), bool),
+                  f"{v['id']}: complete tuple must state expected_combined")
+            if isinstance(v.get("expected_ecdsa"), bool) and isinstance(v.get("expected_combined"), bool):
+                check(v["expected_combined"] == (v["expected_s2c"] and v["expected_ecdsa"]),
+                      f"{v['id']}: expected_combined must equal expected_s2c AND expected_ecdsa")
+        else:
+            check(v.get("expected_ecdsa") is None and v.get("expected_combined") is None,
+                  f"{v['id']}: ecdsa verdicts must be null without pubkey and message_hash")
 
     # 2-4. per vector
     for v in vectors:
@@ -196,6 +227,21 @@ def main(path):
         check(got == v["expected_s2c"],
               f"{v['id']}: expected_s2c={v['expected_s2c']} but independent check says {got} ({why})")
 
+        if v.get("pubkey") is not None and v.get("message_hash") is not None:
+            r, sv = parse_der_strict(der)
+            got_ecdsa = ecdsa_verify(bytes.fromhex(v["pubkey"]),
+                                     bytes.fromhex(v["message_hash"]), r, sv)
+            check(got_ecdsa == v.get("expected_ecdsa"),
+                  f"{v['id']}: expected_ecdsa={v.get('expected_ecdsa')} but independent check says {got_ecdsa}")
+            # compact and DER, when both given, must be the same (r, s)
+            if v.get("signature_compact") is not None:
+                compact = bytes.fromhex(v["signature_compact"])
+                check(len(compact) == 64, f"{v['id']}: signature_compact is not 64 bytes")
+                if len(compact) == 64:
+                    check(int.from_bytes(compact[:32], "big") == r
+                          and int.from_bytes(compact[32:], "big") == sv,
+                          f"{v['id']}: signature_compact and der_sig are different (r, s)")
+
     # 5. boundary
     for b in doc.get("tweak_boundary", []):
         t32 = bytes.fromhex(b["tweak32"])
@@ -211,14 +257,23 @@ def main(path):
     rejecting = [v for v in vectors if not v["expected_s2c"]]
     check(accepting and rejecting, "corpus must contain both accepting and rejecting cases")
     notes.append(f"{len(accepting)} accepting, {len(rejecting)} rejecting")
+    complete_cases = [v for v in vectors if v.get("pubkey") and v.get("message_hash")]
+    notes.append(f"{len(complete_cases)} complete-tuple (s2c + ecdsa), "
+                 f"{len(vectors) - len(complete_cases)} s2c-only")
+    # A class describes the overall verdict, which for a complete tuple is the
+    # combined one. Keying this on expected_s2c alone was wrong: a case with a
+    # committed nonce point and a signature that does not verify is legitimately
+    # expected_s2c=true and expected_combined=false, and the old rule called
+    # that a corpus error.
     by_class = {}
     for v in vectors:
-        by_class.setdefault(v["class"], []).append(v["expected_s2c"])
+        verdict = v["expected_combined"] if v.get("expected_combined") is not None else v["expected_s2c"]
+        by_class.setdefault(v["class"], []).append(verdict)
     for cls, verdicts in sorted(by_class.items()):
         if cls == "honest_signer":
             check(all(verdicts), "honest_signer cases must all accept")
         else:
-            check(not any(verdicts), f"{cls} cases must all reject")
+            check(not any(verdicts), f"{cls} cases must all be rejected overall")
         notes.append(f"class {cls}: {len(verdicts)}")
 
     # a corpus of only-rejects would pass a broken verifier that rejects everything
