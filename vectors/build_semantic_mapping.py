@@ -194,6 +194,9 @@ def main(test_path, out_path):
             } for pk, v in m2_slots.items()],
         }
         m3_note = "M3 is derived, not captured. Every other stage is verbatim from hardware."
+        print("NOTE: vectors/transcript/M3-coordinator-to-signer.psbt.b64 is absent, so M3 "
+              "is derived rather than captured.\n      Run AntiExfilTranscriptExport first "
+              "if you intended to capture it.", file=sys.stderr)
     stages.insert(2, m3)
 
     doc = {

@@ -1,5 +1,7 @@
 package com.sparrowwallet.lark;
 
+import com.sparrowwallet.drongo.Network;
+
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -34,6 +36,22 @@ public final class AntiExfilTranscriptExport {
     public static void main(String[] args) throws Exception {
         Path dir = Paths.get(args.length > 0 ? args[0] : DEFAULT_DIR);
         Files.createDirectories(dir);
+
+        // The fixtures are testnet4 PSBTs carrying a tpub in the global xpub
+        // field, which drongo rejects while the static network is mainnet.
+        //
+        // This must be the first thing that touches Network. Network.get()
+        // lazily initialises the static to mainnet, and Network.set() refuses
+        // to reassign a network that is already set unless it is running inside
+        // a Gradle test worker - which this is not. So there is no reading the
+        // previous value first and no restoring it afterwards: in a fresh JVM
+        // the static is null, set() succeeds, and the process exits with it.
+        Network.set(Network.TESTNET);
+
+        export(dir);
+    }
+
+    private static void export(Path dir) throws Exception {
 
         byte[] entropy = AntiExfilSessionTest.hex(AntiExfilSessionTest.RECORDED_HOST_ENTROPY);
         byte[] pubkey = AntiExfilSessionTest.hex(AntiExfilSessionTest.SIGNER_PUBKEY);

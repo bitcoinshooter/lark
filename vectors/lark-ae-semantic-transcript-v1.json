@@ -17,7 +17,7 @@
   },
   "notes": [
     "Stage bodies are described semantically. The PSBT bytes are the in-PSBT profile's encoding of these fields, not the transcript itself.",
-    "M3 is derived, not captured. Every other stage is verbatim from hardware.",
+    "M3 is captured from a replay of the recorded session, not hand-derived.",
     "The binding scheme here is what this implementation currently does. It is weaker than a frozen-context digest and is expected to be replaced."
   ],
   "stages": [
@@ -57,8 +57,6 @@
     {
       "stage": "M3",
       "direction": "coordinator_to_signer",
-      "derived": true,
-      "note": "not recorded and not captured; fields derived from M1, the M2 opening and the session entropy. Run AntiExfilTranscriptExport to replace this with a captured artifact.",
       "binding": {
         "scheme": "non_witness_txid_of_unsigned_tx",
         "value": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396"
@@ -71,7 +69,10 @@
           "signer_opening": "02edd2346fcdb2882c866f081452b16b4528e7281a6667a7a16fd976c3c7579874",
           "host_entropy": "40d01a3c67c6f762519959eaf013f871b5d024caf70b68cc6552d0a13939493a"
         }
-      ]
+      ],
+      "binding_matches_session": true,
+      "captured": true,
+      "note": "captured by replaying the recorded session; the recorded M4 signature verifies against the opening and entropy carried here"
     },
     {
       "stage": "M4",
