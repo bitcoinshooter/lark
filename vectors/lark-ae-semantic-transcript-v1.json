@@ -1,0 +1,96 @@
+{
+  "schema": "ae-semantic-transcript-v1",
+  "source": "recorded testnet4 ceremony, Jade + lark + Sparrow, in-PSBT profile",
+  "profile": "in-PSBT (0xFC, identifier 'ae')",
+  "construction": {
+    "host_commitment": "tagged_hash(\"s2c/ecdsa/data\", host_entropy)",
+    "tweak": "tagged_hash(\"s2c/ecdsa/point\", signer_opening || host_entropy)",
+    "accept_if": "sig.r == (signer_opening + tweak*G).x mod n"
+  },
+  "session": {
+    "binding_scheme": "non_witness_txid_of_unsigned_tx",
+    "binding": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396",
+    "slot_count": 1,
+    "expected_signers": [
+      "02915fd6388a83fd35f41ef8ec5004b372cb616683d3ac114d48131a62549c8d1a"
+    ]
+  },
+  "notes": [
+    "Stage bodies are described semantically. The PSBT bytes are the in-PSBT profile's encoding of these fields, not the transcript itself.",
+    "M3 is derived, not captured. Every other stage is verbatim from hardware.",
+    "The binding scheme here is what this implementation currently does. It is weaker than a frozen-context digest and is expected to be replaced."
+  ],
+  "stages": [
+    {
+      "stage": "M1",
+      "direction": "coordinator_to_signer",
+      "binding": {
+        "scheme": "non_witness_txid_of_unsigned_tx",
+        "value": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396"
+      },
+      "slots": [
+        {
+          "input_index": 0,
+          "signer_pubkey": "02915fd6388a83fd35f41ef8ec5004b372cb616683d3ac114d48131a62549c8d1a",
+          "host_commitment": "c6d65d57ca32496e0cc6b1cac7a9c4e3ee4fb70c93e34141e996138b4556431a"
+        }
+      ],
+      "binding_matches_session": true
+    },
+    {
+      "stage": "M2",
+      "direction": "signer_to_coordinator",
+      "binding": {
+        "scheme": "non_witness_txid_of_unsigned_tx",
+        "value": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396"
+      },
+      "slots": [
+        {
+          "input_index": 0,
+          "signer_pubkey": "02915fd6388a83fd35f41ef8ec5004b372cb616683d3ac114d48131a62549c8d1a",
+          "host_commitment": "c6d65d57ca32496e0cc6b1cac7a9c4e3ee4fb70c93e34141e996138b4556431a",
+          "signer_opening": "02edd2346fcdb2882c866f081452b16b4528e7281a6667a7a16fd976c3c7579874"
+        }
+      ],
+      "binding_matches_session": true
+    },
+    {
+      "stage": "M3",
+      "direction": "coordinator_to_signer",
+      "derived": true,
+      "note": "not recorded and not captured; fields derived from M1, the M2 opening and the session entropy. Run AntiExfilTranscriptExport to replace this with a captured artifact.",
+      "binding": {
+        "scheme": "non_witness_txid_of_unsigned_tx",
+        "value": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396"
+      },
+      "slots": [
+        {
+          "input_index": 0,
+          "signer_pubkey": "02915fd6388a83fd35f41ef8ec5004b372cb616683d3ac114d48131a62549c8d1a",
+          "host_commitment": "c6d65d57ca32496e0cc6b1cac7a9c4e3ee4fb70c93e34141e996138b4556431a",
+          "signer_opening": "02edd2346fcdb2882c866f081452b16b4528e7281a6667a7a16fd976c3c7579874",
+          "host_entropy": "40d01a3c67c6f762519959eaf013f871b5d024caf70b68cc6552d0a13939493a"
+        }
+      ]
+    },
+    {
+      "stage": "M4",
+      "direction": "signer_to_coordinator",
+      "binding": {
+        "scheme": "non_witness_txid_of_unsigned_tx",
+        "value": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396"
+      },
+      "slots": [
+        {
+          "input_index": 0,
+          "signer_pubkey": "02915fd6388a83fd35f41ef8ec5004b372cb616683d3ac114d48131a62549c8d1a",
+          "host_commitment": "c6d65d57ca32496e0cc6b1cac7a9c4e3ee4fb70c93e34141e996138b4556431a",
+          "signer_opening": "02edd2346fcdb2882c866f081452b16b4528e7281a6667a7a16fd976c3c7579874",
+          "host_entropy": "40d01a3c67c6f762519959eaf013f871b5d024caf70b68cc6552d0a13939493a",
+          "signature_der": "30450221008ed9294bd47bb752cc5c12b04c339a52147d15ace176f6d578bbb7db29c1947202207778889569feab0a2206c45d2603174e01ade535ecbe72ef3b0b555eb163b25701"
+        }
+      ],
+      "binding_matches_session": true
+    }
+  ]
+}
