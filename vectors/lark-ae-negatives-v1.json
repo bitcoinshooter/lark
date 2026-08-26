@@ -1,0 +1,76 @@
+{
+  "schema": "ae-semantic-negatives-v1",
+  "profile": "in-PSBT (0xFC, identifier 'ae')",
+  "base_transcript": "vectors/lark-ae-semantic-transcript-v1.json",
+  "session_binding": "9b1a40c4262970d42dfd35ce01aae13cacd00ebfaad249bf28692788ffef7396",
+  "notes": [
+    "Each case mutates the captured M4 response from the recorded testnet4 ceremony, so the semantic case is identical across transport profiles.",
+    "expected_reason uses the error classes in the shared state machine draft. Those classes are proposed, not agreed.",
+    "A conforming coordinator must reject every case. Which reason it reports is only meaningful once the taxonomy is settled."
+  ],
+  "cases": [
+    {
+      "id": "changed-signing-context",
+      "stage": "M4",
+      "expected_reason": "BINDING",
+      "description": "output amount altered, so the response is not for the frozen transaction",
+      "artifact": "vectors/negatives/changed-signing-context.psbt.b64",
+      "sha256": "4f10900b7e0f46d1c5befabcc1eca286b88331745b2b8e47532d8741c6b84857",
+      "bytes": 708
+    },
+    {
+      "id": "duplicate-ae-record",
+      "stage": "M4",
+      "expected_reason": "STRUCTURE",
+      "description": "the same anti-exfil key appears twice with different values",
+      "artifact": "vectors/negatives/duplicate-ae-record.psbt.b64",
+      "sha256": "cdfa5c74571dbdb1b88458e32f8f71f4c74556dae6848c03a7f3aa0d9109b108",
+      "bytes": 781
+    },
+    {
+      "id": "unknown-ae-subtype",
+      "stage": "M4",
+      "expected_reason": "STRUCTURE",
+      "description": "an unrecognised anti-exfil subtype the coordinator never requested",
+      "artifact": "vectors/negatives/unknown-ae-subtype.psbt.b64",
+      "sha256": "3a9053e4b2d4d0cf532b9fc8bc609b6fba12f5031351c123c588e1db8f0f7914",
+      "bytes": 752
+    },
+    {
+      "id": "cross-key-signature",
+      "stage": "M4",
+      "expected_reason": "MISSING",
+      "description": "the signature is filed under a pubkey that did not produce it",
+      "artifact": "vectors/negatives/cross-key-signature.psbt.b64",
+      "sha256": "f517a7a4f35518a44f5e7a12a34fb3295dfcbffecd164ce013429a7f8dd0bc26",
+      "bytes": 708
+    },
+    {
+      "id": "unrelated-valid-signature",
+      "stage": "M4",
+      "expected_reason": "ECDSA",
+      "description": "a valid signature for another key sits beside a corrupted one for the expected key",
+      "artifact": "vectors/negatives/unrelated-valid-signature.psbt.b64",
+      "sha256": "2ff1aa0d7424dde0dbe30c0f36b2ce1cffe12837705bd57726cce1a87fca526c",
+      "bytes": 816
+    },
+    {
+      "id": "mutation-outside-allowlist",
+      "stage": "M4",
+      "expected_reason": "STRUCTURE",
+      "description": "the signer changed the sighash type in its response",
+      "artifact": "vectors/negatives/mutation-outside-allowlist.psbt.b64",
+      "sha256": "d447bd63ab783519c74c998299905800eacbf695e30a708fcdb968250e340ca8",
+      "bytes": 708
+    },
+    {
+      "id": "stripped-ae-records",
+      "stage": "M4",
+      "expected_reason": "MISSING",
+      "description": "generic trim dropped every anti-exfil record from the response",
+      "artifact": "vectors/negatives/stripped-ae-records.psbt.b64",
+      "sha256": "e1c595d21843e738ddca2f74c75a9ea0b7aff9c02495419e9beaa0e79a8eacf2",
+      "bytes": 491
+    }
+  ]
+}
